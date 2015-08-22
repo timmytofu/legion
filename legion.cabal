@@ -19,9 +19,6 @@ cabal-version:       >=1.10
 library
   exposed-modules:     
     Network.Legion
-    Network.Legion.Data.AddressDescription
-    Network.Legion.Data.Cluster
-    Network.Legion.Data.LegionarySettings
   -- other-modules:       
   -- other-extensions:    
   build-depends:
