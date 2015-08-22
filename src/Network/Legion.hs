@@ -37,10 +37,11 @@ module Network.Legion (
   MulticastDiscovery(..),
   CustomDiscovery(..),
   -- * Utils
-  newMemoryPersistence
+  newMemoryPersistence,
+  diskPersistence
 ) where
 
-import Prelude hiding (lookup, null, mapM)
+import Prelude hiding (lookup, null, mapM, readFile, writeFile)
 
 import Control.Applicative ((<$>))
 import Control.Concurrent (forkIO)
@@ -51,20 +52,20 @@ import Control.Concurrent.STM.TVar (newTVar, modifyTVar, readTVar)
 import Control.Exception (throw, try, SomeException, catch)
 import Control.Monad (void, forever, join)
 import Control.Monad.Trans.Class (MonadTrans, lift)
-import Data.Binary (Binary(put, get), decodeFile)
+import Data.Binary (Binary(put, get), decodeFile, encode)
 import Data.Bool (bool)
-import Data.ByteString.Lazy (ByteString)
+import Data.ByteString.Lazy (ByteString, readFile, writeFile, toStrict)
 import Data.Conduit (Source, Sink, ($$), await, ($=), yield, await, leftover)
 import Data.Conduit.Network (sourceSocket)
 import Data.Conduit.Serialization.Binary (conduitDecode)
 import Data.DoubleWord (Word256(Word256), Word128(Word128))
+import Data.HexString (hexString)
 import Data.List.Split (splitOn)
 import Data.Map (Map, empty, insert, delete, lookup, null, updateLookupWithKey,
   singleton)
 import Data.Maybe (fromJust)
 import Data.Set (Set)
 import Data.Text (Text)
-import Data.UUID (toText)
 import Data.UUID.V1 (nextUUID)
 import Data.Word (Word8, Word64)
 import GHC.Generics (Generic)
@@ -72,10 +73,13 @@ import Network.Socket (Family(AF_INET, AF_INET6, AF_UNIX, AF_CAN),
   SocketOption(ReuseAddr), SocketType(Stream), accept, bindSocket,
   defaultProtocol, listen, setSocketOption, socket, SockAddr(SockAddrInet,
   SockAddrInet6, SockAddrUnix, SockAddrCan), addrAddress, getAddrInfo)
-import System.Directory (doesFileExist)
+import System.Directory (removeFile, doesFileExist)
 import qualified Data.Conduit.List as CL (map)
+import qualified Data.HexString as Hex (toText)
 import qualified Data.Map as Map (empty)
 import qualified Data.Set as Set (empty)
+import qualified Data.Text as T (unpack)
+import qualified Data.UUID as UUID (toText)
 import qualified System.Log.Logger as L (debugM, warningM, errorM)
 
 -- $invocation
@@ -116,7 +120,7 @@ runLegionary legionary settings requestSource = do
 makeNewFirstNode :: (MonadTrans t) => LegionarySettings -> t IO NodeState
 makeNewFirstNode settings = lift $ do
   bindAddr <- resolveAddr (peerBindAddr settings)
-  self <- toText . fromJust <$> nextUUID
+  self <- UUID.toText . fromJust <$> nextUUID
   return NodeState {
       peers = singleton self (BSockAddr bindAddr),
       keyspace = singleton minBound self,
@@ -158,6 +162,9 @@ forkLegionary legionary settings = do
 -- the various partition states. This allows you to choose any number
 -- of persistence strategies, including only in memory, on disk, or in
 -- some external database.
+--
+-- See `newMemoryPersistence` and `diskPersistence` if you need to get
+-- started quickly with an in-memory persistence layer.
 
 
 {- |
@@ -185,8 +192,8 @@ data Legionary request response = Legionary {
 
 {- |
   The type of a user-defined persistence strategy used to persist
-  partition states. See `newMemoryPersistence` if you need to get
-  started quicky.
+  partition states. See `newMemoryPersistence` or `diskPersistence`
+  if you need to get started quicky.
 -}
 data Persistence = Persistence {
     getState :: PartitionKey -> IO (Maybe PartitionState),
@@ -317,6 +324,42 @@ newMemoryPersistence = do
   where
     fetchState cacheT key = atomically $
       lookup key <$> readTVar cacheT
+
+
+{- |
+  A convenient way to persist partition states to disk.
+-}
+diskPersistence
+  :: FilePath
+    -- ^ The directory under which partition states will be stored.
+  -> Persistence
+diskPersistence directory = Persistence {
+      getState,
+      saveState,
+      deleteState
+    }
+  where
+    getState key =
+      let path = toPath key in
+      doesFileExist path >>= bool
+        ((Just . PartitionState) <$> readFile path)
+        (return Nothing)
+
+    saveState key state = writeFile (toPath key) (unstate state)
+
+    deleteState = removeFile . toPath
+
+    {- |
+      Convert a key to a path
+    -}
+    toPath :: PartitionKey -> FilePath
+    toPath key = directory ++ "/" ++ toHex key
+
+    {- |
+      Convert a partition key to a hexidecimal string.
+    -}
+    toHex :: PartitionKey -> String
+    toHex = T.unpack . Hex.toText . hexString . toStrict . encode
 
 
 handlePeerMessage
