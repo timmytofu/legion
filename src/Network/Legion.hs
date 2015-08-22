@@ -50,7 +50,7 @@ import Control.Concurrent.MVar (newEmptyMVar, takeMVar, putMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (newTVar, modifyTVar, readTVar)
 import Control.Exception (throw, try, SomeException, catch)
-import Control.Monad (void, forever, join)
+import Control.Monad (void, forever, join, (>=>))
 import Control.Monad.Trans.Class (MonadTrans, lift)
 import Data.Binary (Binary(put, get), decodeFile, encode)
 import Data.Bool (bool)
@@ -72,7 +72,9 @@ import GHC.Generics (Generic)
 import Network.Socket (Family(AF_INET, AF_INET6, AF_UNIX, AF_CAN),
   SocketOption(ReuseAddr), SocketType(Stream), accept, bindSocket,
   defaultProtocol, listen, setSocketOption, socket, SockAddr(SockAddrInet,
-  SockAddrInet6, SockAddrUnix, SockAddrCan), addrAddress, getAddrInfo)
+  SockAddrInet6, SockAddrUnix, SockAddrCan), addrAddress, getAddrInfo,
+  close, connect)
+import Network.Socket.ByteString.Lazy (sendAll)
 import System.Directory (removeFile, doesFileExist)
 import qualified Data.Conduit.List as CL (map)
 import qualified Data.HexString as Hex (toText)
@@ -126,6 +128,7 @@ makeNewFirstNode settings = lift $ do
       keyspace = singleton minBound self,
       localKeys = Set.empty,
       localDisplacedKeys = Set.empty,
+      self,
       handoffs = [],
       expectingClaims = Map.empty
     }
@@ -365,24 +368,25 @@ diskPersistence directory = Persistence {
 handlePeerMessage
   :: Legionary request response
   -> NodeState
+  -> ConnectionManager
   -> PeerMessage
   -> IO NodeState
 
 handlePeerMessage -- StoreState
     Legionary {persistence}
     nodeState
+    cm
     msg@PeerMessage {source, messageId, payload = StoreState key state}
   = do
     debugM ("Received StoreState: " ++ show msg)
     saveState persistence key state
-    send source (StoreAck messageId)
+    send cm source (StoreAck messageId)
     return nodeState
-  where
-    send = (void .) . error "send undefined"
 
 handlePeerMessage -- NewPeer
     Legionary {}
     nodeState@NodeState {handoffs, peers}
+    _cm
     msg@PeerMessage {payload = NewPeer peer addy}
   = do
     debugM ("Received NewPeer: " ++ show msg)
@@ -398,6 +402,7 @@ handlePeerMessage -- NewPeer
 handlePeerMessage -- StoreAck
     Legionary {}
     nodeState@NodeState {handoffs}
+    _cm
     msg@PeerMessage {payload = StoreAck messageId}
   = do
     debugM ("Received NewPeer: " ++ show msg)
@@ -467,15 +472,16 @@ data NodeState = NodeState {
     keyspace :: Map PartitionKey Peer,
     localKeys :: Set PartitionKey,
     localDisplacedKeys :: Set PartitionKey,
+    self :: Peer,
     handoffs :: [HandoffState],
     expectingClaims :: Map MessageId (Peer, PartitionKey, PartitionKey)
   }
 
 instance Binary NodeState where
-  put (NodeState a b c d _ _) = put (a, b, c, d)
+  put (NodeState a b c d e _ _) = put (a, b, c, d, e)
   get = do
-    (a, b, c, d) <- get
-    return (NodeState a b c d [] Map.empty)
+    (a, b, c, d, e) <- get
+    return (NodeState a b c d e [] Map.empty)
 
 
 {- |
@@ -690,7 +696,7 @@ requestSink
   -> Either LegionarySettings NodeState
   -> Sink (Either PeerMessage (RequestMsg request response)) IO ()
 requestSink legionary (Right nodeState) =
-  requestSink2 legionary nodeState
+  requestSink2 legionary nodeState =<< initConnectionManager nodeState
 requestSink legionary (Left settings) = do
     maybeMsg <- await
     case maybeMsg of
@@ -705,7 +711,7 @@ requestSink legionary (Left settings) = do
             makeNewFirstNode settings
         -- push the message back on the queue and move forward.
         leftover msg
-        requestSink2 legionary nodeState
+        requestSink2 legionary nodeState =<< initConnectionManager nodeState
   where
     joinCluster = error "joinCluster undefined"
 
@@ -717,13 +723,14 @@ requestSink legionary (Left settings) = do
 requestSink2
   :: Legionary request response
   -> NodeState
+  -> ConnectionManager
   -> Sink (Either PeerMessage (RequestMsg request response)) IO ()
-requestSink2 l@Legionary {handleRequest, persistence} nodeState = do
+requestSink2 l@Legionary {handleRequest, persistence} nodeState cm = do
     msg <- await
     case msg of
       Just (Left peerMsg) -> do
-        newNodeState <- lift $ handlePeerMessage l nodeState peerMsg
-        requestSink2 l newNodeState
+        newNodeState <- lift $ handlePeerMessage l nodeState cm peerMsg
+        requestSink2 l newNodeState cm
       Just (Right ((key, request), respond)) -> do
         -- TODO 
         --   - figure out some slick concurrency here, by maintaining
@@ -737,7 +744,7 @@ requestSink2 l@Legionary {handleRequest, persistence} nodeState = do
             updateState key newState
             return response
           )
-        requestSink2 l nodeState
+        requestSink2 l nodeState cm
       Nothing ->
         return ()
   where
@@ -753,9 +760,92 @@ requestSink2 l@Legionary {handleRequest, persistence} nodeState = do
 
 
 {- |
+  Initialize the connection manager based on the node state.
+-}
+initConnectionManager :: (MonadTrans t) => NodeState -> t IO ConnectionManager
+initConnectionManager NodeState {self, peers} = lift $ do
+    cmChan <- newChan
+    -- FIXME `nextId = minBound` here is not sufficient!! We are
+    -- not allowed to ever re-use a message id or else we risk data
+    -- corruption. This is a relatively low probability bug so I'm
+    -- punting for now until I figure out how I want to fix it. Probably
+    -- by making message id be a combination of a startup-generated uuid
+    -- and a number, or something like that.
+    let cmState = CMState {cmPeers = peers, nextId = minBound}
+    (void . forkIO . void) (runManager cmChan cmState)
+    return ConnectionManager {cmChan}
+  where
+    {- |
+      This is the function that implements the actual connection manager.
+    -}
+    runManager :: Chan CMMessage -> CMState -> IO CMState
+    runManager chan = (foldr1 (>=>) . repeat) (
+        \s@CMState {cmPeers, nextId} -> do
+          msg <- readChan chan
+          case msg of
+            Send peer payload ->
+              case getAddr <$> lookup peer cmPeers of
+                Nothing -> logNoPeer peer payload cmPeers
+                Just addy -> do
+                  -- send a message the hard way
+                  -- TODO: reuse socket connections.
+                  so <- socket (fam addy) Stream defaultProtocol
+                  connect so addy
+                  sendAll so (encode PeerMessage {
+                      source = self,
+                      messageId = nextId,
+                      payload
+                    })
+                  close so
+          return s {nextId = succ nextId}
+      )
+
+    logNoPeer peer msg peers_ = errorM
+      $ "Trying to send a message to the unknown peer " ++ show peer
+      ++ ". Not sure how this can happen. Our internal peer table must "
+      ++ "have gotten corrupted somehow. This is a bug. We are dropping "
+      ++ "the message on the floor and continuing as if nothing happened. "
+      ++ "The message payload was: " ++ show msg ++ ". The peer table is: "
+      ++ show peers_
+
+
+{- |
   Does a lookup of a key in a map, and also removes that key from the map.
 -}
 lookupDelete :: (Ord k) => k -> Map k a -> (Maybe a, Map k a)
 lookupDelete = updateLookupWithKey ((const . const) Nothing)
+
+
+{- |
+  A value of this type provides a handle to a connection manager
+  instances.
+-}
+data ConnectionManager =
+  ConnectionManager {
+    cmChan :: Chan CMMessage
+  }
+
+
+{- |
+  This is the internal state of the connection manager.
+-}
+data CMState =
+  CMState {
+    cmPeers :: Map Peer BSockAddr,
+    nextId :: MessageId
+  }
+
+
+{- |
+  This is the type of message understood by the connection manager.
+-}
+data CMMessage = Send Peer PeerMessagePayload
+
+
+{- |
+  Sends a peer message using the connection manager.
+-}
+send :: ConnectionManager -> Peer -> PeerMessagePayload -> IO ()
+send cm peer payload = writeChan (cmChan cm) (Send peer payload)
 
 
