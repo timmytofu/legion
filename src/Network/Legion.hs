@@ -50,24 +50,32 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (newTVar, modifyTVar, readTVar)
 import Control.Exception (throw, try, SomeException, catch)
 import Control.Monad (void, forever, join)
-import Control.Monad.Trans.Class (lift)
-import Data.Binary (Binary(put, get))
+import Control.Monad.Trans.Class (MonadTrans, lift)
+import Data.Binary (Binary(put, get), decodeFile)
+import Data.Bool (bool)
 import Data.ByteString.Lazy (ByteString)
-import Data.Conduit (Source, Sink, ($$), await, ($=), yield, await)
+import Data.Conduit (Source, Sink, ($$), await, ($=), yield, await, leftover)
 import Data.Conduit.Network (sourceSocket)
 import Data.Conduit.Serialization.Binary (conduitDecode)
 import Data.DoubleWord (Word256(Word256), Word128(Word128))
 import Data.List.Split (splitOn)
-import Data.Map (Map, empty, insert, delete, lookup, null, updateLookupWithKey)
+import Data.Map (Map, empty, insert, delete, lookup, null, updateLookupWithKey,
+  singleton)
+import Data.Maybe (fromJust)
 import Data.Set (Set)
 import Data.Text (Text)
+import Data.UUID (toText)
+import Data.UUID.V1 (nextUUID)
 import Data.Word (Word8, Word64)
 import GHC.Generics (Generic)
 import Network.Socket (Family(AF_INET, AF_INET6, AF_UNIX, AF_CAN),
   SocketOption(ReuseAddr), SocketType(Stream), accept, bindSocket,
   defaultProtocol, listen, setSocketOption, socket, SockAddr(SockAddrInet,
   SockAddrInet6, SockAddrUnix, SockAddrCan), addrAddress, getAddrInfo)
+import System.Directory (doesFileExist)
 import qualified Data.Conduit.List as CL (map)
+import qualified Data.Map as Map (empty)
+import qualified Data.Set as Set (empty)
 import qualified System.Log.Logger as L (debugM, warningM, errorM)
 
 -- $invocation
@@ -92,11 +100,31 @@ runLegionary
     -- ^ A source of requests, together with a way to respond to the requets.
   -> IO ()
 runLegionary legionary settings requestSource = do
-    nodeState <- initNodeState settings
+    nodeState <- initNodeState
     (peerMsgSource settings `merge` requestSource)
       $$ requestSink legionary nodeState
   where
-    initNodeState = error "initNodeState undefined"
+    initNodeState =
+      doesFileExist (stateFile settings) >>= bool
+        (return (Left settings))
+        (Right <$> decodeFile (stateFile settings))
+
+
+{- |
+  Build a brand new node state, for the first node in a cluster.
+-}
+makeNewFirstNode :: (MonadTrans t) => LegionarySettings -> t IO NodeState
+makeNewFirstNode settings = lift $ do
+  bindAddr <- resolveAddr (peerBindAddr settings)
+  self <- toText . fromJust <$> nextUUID
+  return NodeState {
+      peers = singleton self (BSockAddr bindAddr),
+      keyspace = singleton minBound self,
+      localKeys = Set.empty,
+      localDisplacedKeys = Set.empty,
+      handoffs = [],
+      expectingClaims = Map.empty
+    }
 
 
 {- |
@@ -183,7 +211,7 @@ type RequestMsg request response = ((PartitionKey, request), response -> IO ())
 {- |
   This is how partitions are identified and referenced.
 -}
-newtype PartitionKey = K {unkey :: Word256} deriving (Eq, Ord, Show)
+newtype PartitionKey = K {unkey :: Word256} deriving (Eq, Ord, Show, Bounded)
 
 instance Binary PartitionKey where
   put (K (Word256 (Word128 a b) (Word128 c d))) = put (a, b, c, d)
@@ -227,7 +255,8 @@ data LegionarySettings = LegionarySettings {
     peerBindAddr :: AddressDescription,
       -- ^ The address on which the legion framework will listen for
       --   rebalancing and cluster management commands.
-    discovery :: DiscoverySettings
+    discovery :: DiscoverySettings,
+    stateFile :: FilePath
   }
 
 
@@ -315,7 +344,7 @@ handlePeerMessage -- NewPeer
   = do
     debugM ("Received NewPeer: " ++ show msg)
     -- add the peer to the list
-    let newPeers = insert peer (getAddr addy) peers
+    let newPeers = insert peer addy peers
     cancel handoffs
     newHandoffs <- kickoff handoffs (peer:fmap to handoffs)
     return nodeState {peers = newPeers, handoffs = newHandoffs}
@@ -391,14 +420,19 @@ resolveAddr desc =
   Defines the local state of a node in the cluster.
 -}
 data NodeState = NodeState {
-    peers :: Map Peer SockAddr,
+    peers :: Map Peer BSockAddr,
     keyspace :: Map PartitionKey Peer,
     localKeys :: Set PartitionKey,
     localDisplacedKeys :: Set PartitionKey,
     handoffs :: [HandoffState],
     expectingClaims :: Map MessageId (Peer, PartitionKey, PartitionKey)
   }
-  deriving (Generic)
+
+instance Binary NodeState where
+  put (NodeState a b c d _ _) = put (a, b, c, d)
+  get = do
+    (a, b, c, d) <- get
+    return (NodeState a b c d [] Map.empty)
 
 
 {- |
@@ -610,14 +644,43 @@ chanToSink chan = do
 -}
 requestSink
   :: Legionary request response
+  -> Either LegionarySettings NodeState
+  -> Sink (Either PeerMessage (RequestMsg request response)) IO ()
+requestSink legionary (Right nodeState) =
+  requestSink2 legionary nodeState
+requestSink legionary (Left settings) = do
+    maybeMsg <- await
+    case maybeMsg of
+      Nothing -> return ()
+      Just msg -> do
+        nodeState <- case msg of
+          Left _peerMsg ->
+            -- The first message is a peer message, join the cluster and continue.
+            joinCluster
+          Right _userMsg ->
+            -- The first message is a user message, create a new cluster.
+            makeNewFirstNode settings
+        -- push the message back on the queue and move forward.
+        leftover msg
+        requestSink2 legionary nodeState
+  where
+    joinCluster = error "joinCluster undefined"
+
+
+{- |
+  This is the second stage of request handling, after the virgin node
+  state has been established
+-}
+requestSink2
+  :: Legionary request response
   -> NodeState
   -> Sink (Either PeerMessage (RequestMsg request response)) IO ()
-requestSink l@Legionary {handleRequest, persistence} nodeState = do
+requestSink2 l@Legionary {handleRequest, persistence} nodeState = do
     msg <- await
     case msg of
       Just (Left peerMsg) -> do
         newNodeState <- lift $ handlePeerMessage l nodeState peerMsg
-        requestSink l newNodeState
+        requestSink2 l newNodeState
       Just (Right ((key, request), respond)) -> do
         -- TODO 
         --   - figure out some slick concurrency here, by maintaining
@@ -631,7 +694,7 @@ requestSink l@Legionary {handleRequest, persistence} nodeState = do
             updateState key newState
             return response
           )
-        requestSink l nodeState
+        requestSink2 l nodeState
       Nothing ->
         return ()
   where
